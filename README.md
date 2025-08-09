@@ -1,26 +1,20 @@
 
-# Adaptive Cloud Firewall — MVP v2
+# Adaptive Cloud Firewall — Prototype v3
 
-This repository contains an enhanced MVP for **Adaptive Cloud Firewall-as-a-Service (A-FaaS)**.
+This prototype is a product-like Streamlit app demonstrating a multi-page Adaptive Cloud Firewall product.
 It includes:
-- traffic simulation (NetFlow-like)
-- threshold & ML-based (IsolationForest) detection
-- adaptive rule engine (block / rate_limit)
-- rule history & audit log
-- mock cloud integration and export capabilities
+- traffic ingestion (simulated NetFlow-like)
+- threshold & ML-based detection (IsolationForest)
+- persistent rule engine (SQLite) with TTL and manual overrides
+- reporting and export
+- mock cloud connector for pilot planning
 
-## Quickstart (Streamlit Cloud)
-1. Push repo to GitHub.
-2. Create Streamlit Cloud app (https://share.streamlit.io) and point to `app.py`.
-3. Run simulation from sidebar and use export features.
-
-## Local run
-```bash
+## Run locally
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
-```
 
-## Pilot steps
-See in-app 'Notes for Facilitator & Pilot Plan' for recommended pilot path from MVP to production.
+## Deploy to Streamlit Cloud
+- Push repo to GitHub
+- Create an app in share.streamlit.io pointing to app.py

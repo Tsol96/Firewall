@@ -1,16 +1,15 @@
 
-Adaptive Cloud Firewall — One Pager (MVP v2)
--------------------------------------------
+Adaptive Cloud Firewall — One Pager (Prototype v3)
+-------------------------------------------------
 Product: Adaptive Cloud Firewall-as-a-Service (A-FaaS)
 Target: SMEs, Municipalities, Multi-cloud startups
 Core value:
-- Reduce incident response time with automated adaptive rules
-- Provide a single pane of glass for multi-cloud flow protection
-Key features (MVP v2):
-- NetFlow-like traffic ingestion simulation
-- Threshold & ML (IsolationForest) based detection
-- Adaptive rule engine (block/rate_limit + TTL)
-- Rule history and downloadable audit reports
+- Automated adaptive protection reduces time-to-block and operational cost
+- Centralised multi-cloud rule management and compliance reporting
+Key features (v3):
+- Product-like web UI (dashboard, threat intel, rule engine, reports)
+- Threshold & ML detection, persistent adaptive rules with TTL
+- Exportable audit logs and reports for compliance
 Pilot proposal:
-- 3-month pilot; connect to VPC Flow Logs / NetFlow; test on non-critical workload
+- 8-week pilot: collector deployment, detection tuning, controlled enforcement, ROI report
 Contact: [Your Name] — [email/contact]
