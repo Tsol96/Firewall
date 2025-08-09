@@ -2,161 +2,280 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
 from datetime import datetime, timedelta
-import json
-import io
+from sklearn.ensemble import IsolationForest
+import json, io, random, time
 
-st.set_page_config(page_title="Adaptive Cloud Firewall - MVP", layout="wide")
+st.set_page_config(page_title="Adaptive Cloud Firewall — MVP v2", layout="wide")
 
-# ---- Helper functions ----
-def simulate_traffic(n=200, start_time=None):
+# ------------------ Helpers ------------------
+def gen_ip(v4=True):
+    return ".".join(str(random.randint(1, 254)) for _ in range(4))
+
+def simulate_netflow(n=600, start_time=None, attack_scenario=None):
     if start_time is None:
-        start_time = datetime.utcnow() - timedelta(hours=4)
-    timestamps = [start_time + timedelta(seconds=60*i) for i in range(n)]
-    # normal traffic baseline
-    baseline = np.random.poisson(lam=120, size=n)
-    # occasional spikes to simulate attacks
-    spikes = np.zeros(n)
-    for _ in range(np.random.randint(1,4)):
-        i = np.random.randint(0, n-20)
-        spikes[i:i+10] += np.random.poisson(lam=300, size=10)
-    # random anomalous requests from suspicious IPs
-    suspicious = np.random.binomial(1, 0.02, size=n) * np.random.randint(100,400,size=n)
-    traffic = baseline + spikes + suspicious
-    src_ips = [f"192.168.{np.random.randint(0,255)}.{np.random.randint(1,254)}" for _ in range(n)]
-    dest_ports = np.random.choice([22,80,443,8080,3306,5900], size=n, p=[0.05,0.35,0.45,0.05,0.05,0.05])
-    methods = np.random.choice(["GET","POST","SSH","OTHER"], size=n, p=[0.5,0.2,0.05,0.25])
-    df = pd.DataFrame({
-        "timestamp": timestamps,
-        "requests": traffic,
-        "src_ip": src_ips,
-        "dest_port": dest_ports,
-        "method": methods
-    })
+        start_time = datetime.utcnow() - timedelta(hours=6)
+    rows = []
+    for i in range(n):
+        timestamp = start_time + timedelta(seconds=30*i)
+        src_ip = gen_ip()
+        dst_ip = "10.0.0." + str(random.randint(1,50))
+        src_port = random.randint(1024,65535)
+        dst_port = random.choice([22,80,443,8080,3306,5900,3389])
+        protocol = random.choice(["TCP","UDP","ICMP"])
+        packets = np.random.poisson(10)
+        byte_size = max(40, int(np.random.normal(1200,300)))
+        duration = max(1, int(np.random.exponential(1.5)))
+        rows.append({
+            "timestamp": timestamp,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "protocol": protocol,
+            "packets": packets,
+            "bytes": byte_size,
+            "duration": duration
+        })
+    df = pd.DataFrame(rows)
+    # insert attack patterns if requested
+    if attack_scenario == "DDoS":
+        t0 = random.randint(50, n-100)
+        for j in range(t0, t0+80):
+            df.loc[j, "packets"] += random.randint(200,800)
+            df.loc[j, "bytes"] += random.randint(20000,80000)
+            df.loc[j, "src_ip"] = gen_ip()
+    elif attack_scenario == "BruteForce":
+        # one IP tries many times to SSH
+        attacker = gen_ip()
+        indices = random.sample(range(n), k=30)
+        for idx in indices:
+            df.loc[idx, "src_ip"] = attacker
+            df.loc[idx, "dst_port"] = 22
+            df.loc[idx, "packets"] += random.randint(1,5)
+    elif attack_scenario == "PortScan":
+        attacker = gen_ip()
+        indices = random.sample(range(n), k=40)
+        for i, idx in enumerate(indices):
+            df.loc[idx, "src_ip"] = attacker
+            df.loc[idx, "dst_port"] = random.randint(1,1024)
+            df.loc[idx, "packets"] = 1
     return df
 
-def detect_threats(df, threshold=300):
-    # simple rule-based detections for MVP
-    df['is_spike'] = df['requests'] > threshold
-    # detect repeated suspicious IPs (brute force)
-    ip_counts = df['src_ip'].value_counts()
-    suspicious_ips = set(ip_counts[ip_counts > 3].index.tolist())
+def detect_anomalies_threshold(df, packet_threshold=2000):
     alerts = []
-    for _, row in df[df['is_spike']].iterrows():
+    df['flow_size'] = df['packets'] * df['bytes']
+    spikes = df[df['flow_size'] > packet_threshold]
+    for _, r in spikes.iterrows():
         alerts.append({
-            "time": row['timestamp'].isoformat(),
-            "type": "Traffic Spike (possible DDoS)",
-            "src_ip": row['src_ip'],
-            "dest_port": int(row['dest_port']),
-            "requests": int(row['requests']),
+            "time": r['timestamp'].isoformat(),
+            "type": "Large Flow Spike",
+            "src_ip": r['src_ip'],
+            "dst_port": int(r['dst_port']),
+            "packets": int(r['packets']),
+            "bytes": int(r['bytes']),
             "severity": "high"
         })
-    for ip in suspicious_ips:
-        alerts.append({
-            "time": datetime.utcnow().isoformat(),
-            "type": "Repeated Requests (possible brute force)",
-            "src_ip": ip,
-            "dest_port": None,
-            "requests": int(ip_counts[ip]),
-            "severity": "medium"
-        })
+    # repeated connections from same IP
+    ip_counts = df['src_ip'].value_counts()
+    for ip, cnt in ip_counts.items():
+        if cnt > 8:
+            alerts.append({
+                "time": datetime.utcnow().isoformat(),
+                "type": "Repeated Connections (possible brute force)",
+                "src_ip": ip,
+                "dst_port": None,
+                "requests": int(cnt),
+                "severity": "medium"
+            })
     return alerts
 
-def adaptive_rules_engine(alerts, current_rules):
-    # Simulate adaptive behavior: create or tighten rules based on alerts
+def detect_anomalies_iforest(df):
+    alerts = []
+    # features for anomaly detection
+    X = df[['packets','bytes','duration']].fillna(0)
+    # small sample handling
+    if len(X) < 20:
+        return alerts
+    clf = IsolationForest(n_estimators=100, contamination=0.03, random_state=42)
+    preds = clf.fit_predict(X)
+    df['anomaly_score'] = preds
+    anomalies = df[df['anomaly_score'] == -1]
+    for _, r in anomalies.iterrows():
+        alerts.append({
+            "time": r['timestamp'].isoformat(),
+            "type": "ML Anomaly",
+            "src_ip": r['src_ip'],
+            "dst_port": int(r['dst_port']),
+            "packets": int(r['packets']),
+            "bytes": int(r['bytes']),
+            "severity": "high"
+        })
+    # add frequent IPs as medium suspicion
+    ip_counts = df['src_ip'].value_counts()
+    for ip, cnt in ip_counts.items():
+        if cnt > 10:
+            alerts.append({
+                "time": datetime.utcnow().isoformat(),
+                "type": "Frequent Source IP",
+                "src_ip": ip,
+                "requests": int(cnt),
+                "severity": "medium"
+            })
+    return alerts
+
+def adaptive_rules_engine(alerts, rules):
     changes = []
     for a in alerts:
-        if a['type'].startswith("Traffic Spike"):
-            rule = {"action":"rate_limit","target_ip":a['src_ip'],"params":{"max_rps":50}}
-            changes.append(("add_or_update", rule))
-        elif a['type'].startswith("Repeated Requests"):
-            rule = {"action":"block","target_ip":a['src_ip'],"params":{"duration_min":60}}
-            changes.append(("add_or_update", rule))
-    # apply changes to current_rules (simple dict merge)
-    for op, rule in changes:
-        key = rule['target_ip']
-        current_rules[key] = rule
-    history_entries = [{"time": datetime.utcnow().isoformat(), "changes": changes}] if changes else []
-    return current_rules, history_entries
+        ip = a.get('src_ip')
+        if not ip:
+            continue
+        if a['severity'] == 'high':
+            # block for 30 minutes
+            rule = {"action":"block","target_ip":ip,"params":{"expire_min":30}, "reason":a['type'], "applied_at": datetime.utcnow().isoformat()}
+            rules[ip] = rule
+            changes.append(("add_block", rule))
+        elif a['severity'] == 'medium':
+            # rate limit or challenge
+            rule = {"action":"rate_limit","target_ip":ip,"params":{"rps":50, "expire_min":60}, "reason":a['type'], "applied_at": datetime.utcnow().isoformat()}
+            rules[ip] = rule
+            changes.append(("add_rate_limit", rule))
+    # cleanup expired (handled on next run)
+    now = datetime.utcnow()
+    expired = []
+    for ip, r in list(rules.items()):
+        applied = datetime.fromisoformat(r['applied_at'])
+        expire_min = r['params'].get('expire_min', 60)
+        if now > applied + timedelta(minutes=expire_min):
+            expired.append(ip)
+            del rules[ip]
+            changes.append(("expire", {"target_ip": ip}))
+    return rules, changes
 
-# ---- App UI ----
-st.title("Adaptive Cloud Firewall — MVP")
-st.markdown("""
-**What this demo shows:** a lightweight simulation of an adaptive cloud firewall-as-a-service (A-FaaS).
-- Real-time traffic simulation
-- Rule engine that *adapts* rules based on detected anomalies
-- Dashboard, Threat Table, Rule History and JSON export for reporting
-""")
+# ------------------ UI ------------------
+st.title("Adaptive Cloud Firewall — MVP v2 (English)")
+st.markdown("An enhanced prototype demonstrating detection, adaptive rules, cloud-integration mock, and reporting.")
 
-col1, col2 = st.columns([2,1])
+# Sidebar controls
+with st.sidebar:
+    st.header("Simulation Controls")
+    n_points = st.slider("Traffic points", 100, 2000, 600, step=50)
+    attack = st.selectbox("Inject attack scenario", ["None","DDoS","BruteForce","PortScan"])
+    detection_mode = st.selectbox("Detection engine", ["Threshold","IsolationForest (ML)"])
+    threshold_flow = st.number_input("Threshold flow_size (packets*bytes) for rule-based", value=20000, step=1000)
+    run_sim = st.button("Run Simulation")
+    st.markdown("---")
+    st.header("Demo Actions")
+    if st.button("Simulate 'Apply to Cloud' (mock)"):
+        st.session_state['last_action'] = {"time": datetime.utcnow().isoformat(), "action": "mock_apply", "status": "ok"}
+    st.markdown("Export: JSON / CSV available in main panel.")
+
+# initialize session state
+if 'rules' not in st.session_state:
+    st.session_state['rules'] = {}
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
+if 'alerts' not in st.session_state:
+    st.session_state['alerts'] = []
+if 'last_df' not in st.session_state:
+    st.session_state['last_df'] = pd.DataFrame()
+
+# Run simulation
+if run_sim:
+    df = simulate_netflow(n=n_points, attack_scenario=attack if attack != "None" else None)
+    st.session_state['last_df'] = df.copy()
+    if detection_mode == "Threshold":
+        alerts = detect_anomalies_threshold(df, packet_threshold=threshold_flow)
+    else:
+        alerts = detect_anomalies_iforest(df)
+    st.session_state['alerts'] = alerts
+    # apply adaptive engine
+    st.session_state['rules'], changes = adaptive_rules_engine(alerts, st.session_state['rules'])
+    if changes:
+        st.session_state['history'].append({"time": datetime.utcnow().isoformat(), "changes": changes})
+
+# Main layout
+col1, col2 = st.columns([3,1])
+with col1:
+    st.subheader("Traffic timeline (requests proxy)")
+    if not st.session_state['last_df'].empty:
+        ts = st.session_state['last_df'].set_index('timestamp').resample('1T').packets.sum()
+        st.line_chart(ts)
+    else:
+        st.info("Run the simulation from the sidebar to generate traffic.")
+
+    st.subheader("Top Source IPs")
+    if not st.session_state['last_df'].empty:
+        top_ips = st.session_state['last_df']['src_ip'].value_counts().head(15)
+        st.bar_chart(top_ips)
+    st.subheader("Alerts (latest)")
+    if st.session_state['alerts']:
+        st.dataframe(pd.DataFrame(st.session_state['alerts']))
+    else:
+        st.info("No alerts detected yet.")
 
 with col2:
-    st.header("Controls")
-    st.markdown("Adjust simulation and detection settings")
-    n_points = st.slider("Number of traffic points", min_value=50, max_value=1000, value=240, step=10)
-    threshold = st.slider("Spike detection threshold (requests)", min_value=200, max_value=800, value=350, step=10)
-    run_sim = st.button("Run Simulation")
-    if 'rules' not in st.session_state:
-        st.session_state['rules'] = {}
-    if 'history' not in st.session_state:
-        st.session_state['history'] = []
-
-with col1:
-    st.header("Live Traffic & Analysis")
-    if run_sim:
-        progress = st.progress(0)
-        df = simulate_traffic(n=n_points)
-        alerts = detect_threats(df, threshold=threshold)
-        # Run adaptive engine
-        st.session_state['rules'], history_entries = adaptive_rules_engine(alerts, st.session_state['rules'])
-        st.session_state['history'].extend(history_entries)
-
-        # Show time series
-        st.subheader("Traffic (requests per minute)")
-        st.line_chart(df.set_index('timestamp')['requests'])
-
-        st.subheader("Top 10 source IPs (by generated requests)")
-        ip_counts = df['src_ip'].value_counts().head(10)
-        st.bar_chart(ip_counts)
-
-        st.subheader("Detected Alerts")
-        if alerts:
-            alerts_df = pd.DataFrame(alerts)
-            st.dataframe(alerts_df)
-        else:
-            st.success("No alerts detected in this simulation run.")
-
-        st.subheader("Active Adaptive Rules")
-        if st.session_state['rules']:
-            rules_df = pd.DataFrame.from_dict(st.session_state['rules'], orient='index')
-            st.dataframe(rules_df)
-        else:
-            st.info("No adaptive rules have been applied yet.")
-
+    st.subheader("Live Metrics")
+    if not st.session_state['last_df'].empty:
+        total_packets = int(st.session_state['last_df']['packets'].sum())
+        st.metric("Total packets (current simulation)", total_packets)
+    st.metric("Active Rules", len(st.session_state['rules']))
+    blocked = [ip for ip,r in st.session_state['rules'].items() if r['action']=='block']
+    st.metric("Blocked IPs", len(blocked))
 
 st.markdown("---")
-st.header("Rule History & Reporting")
+st.subheader("Active Adaptive Rules")
+if st.session_state['rules']:
+    rules_df = pd.DataFrame.from_dict(st.session_state['rules'], orient='index')
+    rules_df = pd.DataFrame.from_dict(st.session_state['rules'], orient='index')
+    st.dataframe(rules_df)
+else:
+    st.info("No adaptive rules have been applied. Run simulation.")
 
-if st.session_state.get('history'):
-    hist_df = pd.DataFrame([{"time":h['time'], "changes": json.dumps(h['changes'])} for h in st.session_state['history']])
+st.markdown("---")
+st.subheader("Rule History & Audit Log")
+if st.session_state['history']:
+    hist_df = pd.DataFrame(st.session_state['history'])
     st.dataframe(hist_df)
 else:
-    st.info("No rule changes recorded yet. Run a simulation to generate rule changes.")
+    st.info("Rule history is empty. Simulate attacks to populate history.")
 
-# Export JSON report
-st.markdown("### Export security report (JSON)")
-if st.button("Generate JSON Report"):
-    report = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "alerts": st.session_state.get('last_alerts', []),
-        "rules": list(st.session_state.get('rules', {}).values()),
-        "history": st.session_state.get('history', [])
-    }
-    b = io.BytesIO(json.dumps(report, indent=2).encode('utf-8'))
-    st.download_button("Download JSON report", data=b, file_name="adaptive_firewall_report.json", mime="application/json")
-
+# Export / Reporting
 st.markdown("---")
-st.write("**Notes for facilitator:** This MVP intentionally uses simulated data and simple rule logic to demonstrate core product behaviour: detection → adaptive response → rule persistence. For a pilot we propose: (1) connect to real flow logs (NetFlow/IPFIX), (2) integrate with cloud provider APIs (AWS WAF, Azure Firewall) or edge proxies, and (3) extend ML models for anomaly detection.")
+st.subheader("Export / Reporting")
+if st.button("Download last traffic CSV"):
+    if not st.session_state['last_df'].empty:
+        csv = st.session_state['last_df'].to_csv(index=False).encode('utf-8')
+        st.download_button("Download traffic.csv", data=csv, file_name="traffic.csv", mime="text/csv")
 
-st.markdown("**MVP Author:** _Prepared for pilot/demo — Adaptive Cloud Firewall - MVP_")
+if st.button("Download alerts JSON"):
+    if st.session_state['alerts']:
+        b = io.BytesIO(json.dumps(st.session_state['alerts'], indent=2, default=str).encode('utf-8'))
+        st.download_button("Download alerts.json", data=b, file_name="alerts.json", mime="application/json")
+    else:
+        st.info("No alerts to export.")
+
+# Integration Mock
+st.markdown("---")
+st.subheader("Cloud Integration Mock (no external calls)")
+st.markdown("""This demo includes a mock "Apply to Cloud" action that simulates calling cloud provider APIs (AWS WAF / Azure Firewall). 
+In a real pilot we'd implement connectors using provider SDKs and IAM roles. Refer to the README for steps.""")
+
+if st.session_state.get('last_action'):
+    st.write("Last action:", st.session_state['last_action'])
+
+# Facilitator notes and pilot plan
+st.markdown("---")
+st.header("Notes for Facilitator & Pilot Plan")
+st.markdown("""
+**What this prototype demonstrates:** detection → adaptive response → rule persistence → reporting.
+**Pilot steps to go from MVP to production-ready pilot:**
+1. Connect to real NetFlow/IPFIX or VPC Flow Logs.  
+2. Deploy a lightweight collector (e.g., Fluentd/Fluent Bit) and push to processing pipeline.  
+3. Integrate with cloud provider firewall APIs (AWS WAF, Azure Firewall) or on-prem edge proxies.  
+4. Harden anomaly detection models (feature engineering, thresholds, retraining).  
+5. Add authentication, RBAC, audit trails, and SLA monitoring.  
+6. 3-month pilot: endpoint in a municipal or SME environment, 1-week setup, 8-week testing, results & ROI report.
+""")
+
+st.markdown("**Author:** Prepared for pilot/demo — Adaptive Cloud Firewall — MVP v2")
