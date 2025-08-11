@@ -3,20 +3,19 @@ version: "3.8"
 services:
   backend:
     build: ./backend
-    volumes:
-      - ./backend:/app
     ports:
       - "8000:8000"
+    volumes:
+      - ./backend:/app
     environment:
-      - DB_PATH=/data/afw.db
-      - JWT_SECRET=change_this_now
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+      - JWT_SECRET=change_me
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
   frontend:
     build: ./frontend
-    volumes:
-      - ./frontend:/app
     ports:
       - "8501:8501"
+    volumes:
+      - ./frontend:/app
     environment:
       - API_URL=http://backend:8000
     command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
